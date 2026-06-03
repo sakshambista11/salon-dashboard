@@ -7,20 +7,19 @@ import pandas as pd
 guest_summary = pd.read_csv("guest_summary.csv")
 df = pd.read_csv("appointments_clean.csv")
 df["Appointment Date"] = pd.to_datetime(df["Appointment Date"])
+# Find count of unique customers grouped by month
 monthly_customers = df.groupby(df["Appointment Date"].dt.to_period("M"))["Guest Name"].nunique()
 monthly_customers = monthly_customers[monthly_customers.index < pd.Timestamp("today").to_period("M")]
 stylists = sorted(guest_summary["PreferredStylist"].dropna().unique().tolist())
-# Keep only stylists with enough customers to be meaningful
-
 # Find each stylist's most recent appointment
 last_active = df.groupby("Stylist")["Appointment Date"].max()
 recent_cutoff = pd.Timestamp("today") - pd.Timedelta(days=90)
 current_stylists = last_active[last_active >= recent_cutoff].index
-
+# Find preferred stylist using current stylist and having atleast 30 customers
 stylist_counts = guest_summary["PreferredStylist"].value_counts()
 main_stylists = stylist_counts[(stylist_counts >= 30) & (stylist_counts.index.isin(current_stylists))].index
 retention_data = guest_summary[guest_summary["PreferredStylist"].isin(main_stylists)]
-
+# Building stylist retention grid
 stylist_retention = pd.crosstab(
     retention_data["PreferredStylist"], retention_data["Status"], normalize="index"
 ) * 100
@@ -164,7 +163,7 @@ def server(input, output, session):
             data = data[data["PreferredStylist"] == input.stylist_filter()]
         if input.name_search():
             data = data[data["Guest Name"].str.contains(
-                input.name_search(), case=False, na=False
+                input.name_search(), case=False, na=False, regex=False
             )]
         data = data.sort_values("DaysSinceLastVisit", ascending=False)
         display = data[[
