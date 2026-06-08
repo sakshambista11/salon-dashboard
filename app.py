@@ -1,30 +1,15 @@
-from shiny import App, ui, render
+from shiny import App, ui, render, reactive
+import pipeline
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
 
 # Load data once at the top
-guest_summary = pd.read_csv("guest_summary.csv")
-df = pd.read_csv("appointments_clean.csv")
-df["Appointment Date"] = pd.to_datetime(df["Appointment Date"])
-# Find count of unique customers grouped by month
-monthly_customers = df.groupby(df["Appointment Date"].dt.to_period("M"))["Guest Name"].nunique()
-monthly_customers = monthly_customers[monthly_customers.index < pd.Timestamp("today").to_period("M")]
-stylists = sorted(guest_summary["PreferredStylist"].dropna().unique().tolist())
-# Find each stylist's most recent appointment
-last_active = df.groupby("Stylist")["Appointment Date"].max()
-recent_cutoff = pd.Timestamp("today") - pd.Timedelta(days=90)
-current_stylists = last_active[last_active >= recent_cutoff].index
-# Find preferred stylist using current stylist and having atleast 30 customers
-stylist_counts = guest_summary["PreferredStylist"].value_counts()
-main_stylists = stylist_counts[(stylist_counts >= 30) & (stylist_counts.index.isin(current_stylists))].index
-retention_data = guest_summary[guest_summary["PreferredStylist"].isin(main_stylists)]
-# Building stylist retention grid
-stylist_retention = pd.crosstab(
-    retention_data["PreferredStylist"], retention_data["Status"], normalize="index"
-) * 100
-stylist_retention = stylist_retention.reindex(columns=["Active", "At Risk", "Churned"], fill_value=0)
-stylist_retention = stylist_retention.sort_values("Active")
+_init_df = pd.read_csv("appointments_clean.csv")
+_init_df["Appointment Date"] = pd.to_datetime(_init_df["Appointment Date"])
+_init_df["Booked Date"] = pd.to_datetime(_init_df["Booked Date"], format='mixed')
+_init_gs = pd.read_csv("guest_summary.csv")
+_init_stylists = sorted(_init_gs["PreferredStylist"].dropna().unique().tolist())
 
 # UI definition
 app_ui = ui.page_fluid(
@@ -74,7 +59,7 @@ app_ui = ui.page_fluid(
             ),
             ui.input_select(
                 "stylist_filter", "Stylist",
-                choices=["All"] + stylists,
+                choices=["All"] + _init_stylists,
                 selected="All"
             ),
             ui.input_text("name_search", "Search by name"),
@@ -89,57 +74,116 @@ app_ui = ui.page_fluid(
         ui.output_plot("stylist_chart"),
     )
         ),
+        ui.nav_panel("Refresh Data",
+                ui.card( 
+                     ui.h3("Update Dashboard Data"),
+                     ui.output_text("cutoff_message"),
+                     ui.input_file("new_data", "Upload Zenoti Export", accept=[".csv"]),
+                     ui.output_text("upload_status")))
     )
 )
 
 # Server logic
 def server(input, output, session):
+    clean_df = reactive.Value(_init_df)
+    guest_summary_rv = reactive.Value(_init_gs)
+    upload_msg = reactive.Value("")
+    @reactive.Effect
+    @reactive.event(input.new_data)
+    def handle_upload():
+        file_info = input.new_data()
+        if file_info is None:
+            return
+        path = file_info[0]["datapath"]
+        updated_df = pipeline.merge_incremental(clean_df(), path)
+        updated_gs = pipeline.run_pipeline(updated_df)
+        updated_df.to_csv("appointments_clean.csv", index=False)
+        updated_gs.to_csv("guest_summary.csv", index=False)
+        clean_df.set(updated_df)
+        guest_summary_rv.set(updated_gs)
+        upload_msg.set("✓ Data updated successfully.")
+    @render.text
+    def upload_status():
+        return upload_msg()
+    @render.text
+    def cutoff_message():
+        df = clean_df()
+        date = pipeline.get_data_cutoff(df)
+        message = f"Your data is current through {date}. To refresh, export appointments from Zenoti starting {date} and upload below."
+        return message
+    @reactive.Calc
+    def monthly_customers():
+        df = clean_df()
+        mc = df.groupby(df["Appointment Date"].dt.to_period("W"))["Guest Name"].nunique()
+        mc = mc[mc.index < pd.Timestamp("today").to_period("W")]
+        return mc
+    @reactive.Calc
+    def stylist_options():
+        guest_summary = guest_summary_rv()
+        stylists = sorted(guest_summary["PreferredStylist"].dropna().unique().tolist())
+        return stylists
+    @reactive.Calc
+    def stylist_retention():
+        df = clean_df()
+        guest_summary = guest_summary_rv()
+        last_active = df.groupby("Stylist")["Appointment Date"].max()
+        recent_cutoff = pd.Timestamp("today") - pd.Timedelta(days=90)
+        current_stylists = last_active[last_active >= recent_cutoff].index
+        stylist_counts = guest_summary["PreferredStylist"].value_counts()
+        main_stylists = stylist_counts[(stylist_counts >= 30) & (stylist_counts.index.isin(current_stylists))].index
+        retention_data = guest_summary[guest_summary["PreferredStylist"].isin(main_stylists)]
+        stylist_retention = pd.crosstab(
+            retention_data["PreferredStylist"], retention_data["Status"], normalize="index"
+        ) * 100
+        stylist_retention = stylist_retention.reindex(columns=["Active", "At Risk", "Churned"], fill_value=0)
+        stylist_retention = stylist_retention.sort_values("Active")
+        return stylist_retention
     @render.text
     def active_count():
-        count = (guest_summary["Status"] == "Active").sum()
+        count = (guest_summary_rv()["Status"] == "Active").sum()
         return f"{count:,}"  # we'll fill this in
     @render.text
     def at_risk_count():
-        count = (guest_summary["Status"] == "At Risk").sum()
+        count = (guest_summary_rv()["Status"] == "At Risk").sum()
         return f"{count:,}"
     @render.text
     def churned_count():
-        count = (guest_summary["Status"] == "Churned").sum()
+        count = (guest_summary_rv()["Status"] == "Churned").sum()
         return f"{count:,}"
     @render.text
     def active_pct():
-        total = len(guest_summary)
-        pct = (guest_summary["Status"] == "Active").sum() / total * 100
+        total = len(guest_summary_rv())
+        pct = (guest_summary_rv()["Status"] == "Active").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def at_risk_pct():
-        total = len(guest_summary)
-        pct = (guest_summary["Status"] == "At Risk").sum() / total * 100
+        total = len(guest_summary_rv())
+        pct = (guest_summary_rv()["Status"] == "At Risk").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def churned_pct():
-        total = len(guest_summary)
-        pct = (guest_summary["Status"] == "Churned").sum() / total * 100
+        total = len(guest_summary_rv())
+        pct = (guest_summary_rv()["Status"] == "Churned").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def new_guest_stat():
-        single_visit = (guest_summary["VisitCount"] == 1).sum()
-        total_guest = len(guest_summary)
+        single_visit = (guest_summary_rv()["VisitCount"] == 1).sum()
+        total_guest = len(guest_summary_rv())
         no_return_pct = (single_visit/total_guest) * 100
         return f"{no_return_pct:.0f}% of new guests never return"
     @render.text
     def new_guest_detail():
-        single = (guest_summary["VisitCount"] == 1).sum()
-        total = len(guest_summary)
+        single = (guest_summary_rv()["VisitCount"] == 1).sum()
+        total = len(guest_summary_rv())
         returned = total - single
         return f"Out of {total:,} first-time visitors, only {returned:,} came back."
-    import matplotlib.dates as mdates
+
 
     @render.plot
     def trend_chart():
         fig, ax = plt.subplots(figsize=(10, 4), tight_layout=True)
-        x_data = monthly_customers.index.to_timestamp()
-        y_data = monthly_customers.values
+        x_data = monthly_customers().index.to_timestamp()
+        y_data = monthly_customers().values
         ax.plot(x_data, y_data, color="#2b5c8f", linewidth=2.5, label="Active Customers")
         ax.fill_between(x_data, y_data, color="#2b5c8f", alpha=0.1)
         ax.spines['top'].set_visible(False)
@@ -153,10 +197,15 @@ def server(input, output, session):
         ax.grid(True, which='major', axis='x', linestyle=':', alpha=0.4, color='#e0e0e0')
         ax.tick_params(axis='both', which='major', labelsize=9, colors='#444444')
         ax.set_ylabel("Unique Customers", fontsize=10, color='#444444', labelpad=10)
+        cutoff = pipeline.get_data_cutoff(clean_df())
+        ax.axvline(pd.Timestamp(cutoff), color='#999', linestyle='--', linewidth=1)
+        ax.annotate(str(cutoff), xy=(pd.Timestamp(cutoff), ax.get_ylim()[1]),
+            xytext=(-5, -5), textcoords='offset points',
+            ha='right', va='top', fontsize=9, color='#666')
         return fig
     @render.data_frame
     def customer_table():
-        data = guest_summary.copy()
+        data = guest_summary_rv().copy()
         if input.status_filter() != "All":
             data = data[data["Status"] == input.status_filter()]
         if input.stylist_filter() != "All":
@@ -177,10 +226,10 @@ def server(input, output, session):
     def stylist_chart():
         fig, ax = plt.subplots(figsize=(10, 6), tight_layout=True)
 
-        names = stylist_retention.index
-        active = stylist_retention["Active"]
-        at_risk = stylist_retention["At Risk"]
-        churned = stylist_retention["Churned"]
+        names = stylist_retention().index
+        active = stylist_retention()["Active"]
+        at_risk = stylist_retention()["At Risk"]
+        churned = stylist_retention()["Churned"]
 
         ax.barh(names, active, color="#2e7d32", label="Active")
         ax.barh(names, at_risk, left=active, color="#f5a623", label="At Risk")
