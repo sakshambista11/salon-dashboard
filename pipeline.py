@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 CHURN_CEILING = 180
 SINGLE_ACTIVE = 60
 SINGLE_AT_RISK = 120
@@ -114,3 +115,21 @@ def merge_incremental(existing_clean_df, new_upload_path):
     
 def get_data_cutoff(df):
     return pd.to_datetime(df["Appointment Date"]).max().date()
+
+def build_cohort_retention(df):
+    df = df.copy()
+    first_month_visit = df.groupby("Guest Name")['Appointment Date'].min().dt.to_period("M")
+    df["cohort_month"] = df['Guest Name'].map(first_month_visit)
+    df["appt_month"] = df["Appointment Date"].dt.to_period("M")
+    df["months_offset"] = (df["appt_month"] - df["cohort_month"]).apply(lambda x: x.n)
+    df = df[df["months_offset"].between(0, 12)]
+    counts = df.groupby(["cohort_month", "months_offset"])['Guest Name'].nunique()
+    matrix = counts.unstack(fill_value=0)
+    retention = matrix.div(matrix[0], axis=0) * 100
+    today_period = pd.Period(pd.Timestamp("today"), "M")
+    for cohort in retention.index:
+        max_offset = (today_period - cohort).n
+        retention.loc[cohort, retention.columns > max_offset] = np.nan
+    cutoff = pd.Period(pd.Timestamp("today"), "M") - 36
+    retention = retention[retention.index >= cutoff]
+    return retention

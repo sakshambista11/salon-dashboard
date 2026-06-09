@@ -74,6 +74,13 @@ app_ui = ui.page_fluid(
         ui.output_plot("stylist_chart"),
     )
         ),
+        ui.nav_panel("Cohort Retention",
+            ui.card(
+            ui.h3("New Customer Cohort Retention"),
+            ui.p("Each row is a group of customers who first visited in that month. Columns show what % of that group returned in subsequent months."),
+            ui.output_plot("cohort_chart", height="700px"),
+    )
+),
         ui.nav_panel("Refresh Data",
                 ui.card( 
                      ui.h3("Update Dashboard Data"),
@@ -88,6 +95,9 @@ def server(input, output, session):
     clean_df = reactive.Value(_init_df)
     guest_summary_rv = reactive.Value(_init_gs)
     upload_msg = reactive.Value("")
+    @reactive.Calc
+    def cohort_retention():
+        return pipeline.build_cohort_retention(clean_df())
     @reactive.Effect
     @reactive.event(input.new_data)
     def handle_upload():
@@ -178,7 +188,30 @@ def server(input, output, session):
         returned = total - single
         return f"Out of {total:,} first-time visitors, only {returned:,} came back."
 
+    @render.plot
+    def cohort_chart():
+        matrix = cohort_retention()
+        fig, ax = plt.subplots(figsize=(16, 16), tight_layout=True)
+        im = ax.imshow(matrix.values, aspect="auto", cmap="YlGn", vmin=0, vmax=40)
+        fig.colorbar(im, ax=ax, label="Retention %")
 
+        ax.set_xticks(range(len(matrix.columns)))
+        ax.set_xticklabels(matrix.columns)
+        ax.set_yticks(range(len(matrix.index)))
+        ax.set_yticklabels([str(p) for p in matrix.index], fontsize=9)
+
+        for i in range(matrix.shape[0]):
+            for j in range(matrix.shape[1]):
+                val = matrix.iloc[i, j]
+                if not pd.isna(val):
+                    text_color = "white" if val > 25 else "black"
+                    ax.text(j, i, f"{val:.0f}", ha="center", va="center",
+                            fontsize=8, color=text_color)
+
+        ax.set_xlabel("Months since first visit")
+        ax.set_ylabel("Cohort (first visit month)")
+        return fig
+    
     @render.plot
     def trend_chart():
         fig, ax = plt.subplots(figsize=(10, 4), tight_layout=True)
