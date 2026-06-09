@@ -1,0 +1,4 @@
+shiny==1.6.3
+pandas==2.3.0
+numpy==2.3.0
+matplotlib==3.10.3

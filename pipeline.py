@@ -8,6 +8,8 @@ _DEDUP_COLS=['Appointment Date', 'Booked Date', 'Invoice No', 'Guest Name',
        'Service Name', 'Center Name', 'Start Time', 'End Time',
        'Scheduled Service Duration', 'Scheduled Service and Recovery Duration',
        'Recovery Time', 'Stylist', 'Status']
+def today():
+    return pd.Timestamp.now(tz="America/Chicago").normalize().tz_localize(None)
 
 def load_raw(filepath):
     df = pd.read_csv(filepath)
@@ -70,7 +72,7 @@ def _classify(row):
 
 def build_guest_summary(df, visits):
 
-    ref_date = pd.Timestamp("today").normalize()
+    ref_date = today()
  
     summary = visits.groupby("Guest Name").agg(
         AverageGap = ("Gap",              "mean"),
@@ -117,6 +119,8 @@ def get_data_cutoff(df):
     return pd.to_datetime(df["Appointment Date"]).max().date()
 
 def build_cohort_retention(df):
+    if df.empty:
+        return pd.DataFrame()
     df = df.copy()
     first_month_visit = df.groupby("Guest Name")['Appointment Date'].min().dt.to_period("M")
     df["cohort_month"] = df['Guest Name'].map(first_month_visit)
@@ -126,10 +130,10 @@ def build_cohort_retention(df):
     counts = df.groupby(["cohort_month", "months_offset"])['Guest Name'].nunique()
     matrix = counts.unstack(fill_value=0)
     retention = matrix.div(matrix[0], axis=0) * 100
-    today_period = pd.Period(pd.Timestamp("today"), "M")
+    today_period = pd.Period(today(), "M")
     for cohort in retention.index:
         max_offset = (today_period - cohort).n
         retention.loc[cohort, retention.columns > max_offset] = np.nan
-    cutoff = pd.Period(pd.Timestamp("today"), "M") - 36
+    cutoff = pd.Period(today(), "M") - 36
     retention = retention[retention.index >= cutoff]
     return retention

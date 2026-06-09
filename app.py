@@ -4,11 +4,28 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
 
-# Load data once at the top
-_init_df = pd.read_csv("appointments_clean.csv")
-_init_df["Appointment Date"] = pd.to_datetime(_init_df["Appointment Date"])
-_init_df["Booked Date"] = pd.to_datetime(_init_df["Booked Date"], format='mixed')
-_init_gs = pd.read_csv("guest_summary.csv")
+# Load data once at the top, fall back to empty frames if files don't exist yet
+def _load_or_empty():
+    appt_cols = ["Appointment Date", "Booked Date", "Invoice No", "Guest Name",
+                 "Service Name", "Center Name", "Start Time", "End Time",
+                 "Scheduled Service Duration", "Stylist", "Status"]
+    gs_cols = ["Guest Name", "AverageGap", "LastVisit", "VisitCount",
+               "DaysSinceLastVisit", "Status", "LastService", "PreferredStylist"]
+    try:
+        df = pd.read_csv("appointments_clean.csv")
+        df["Appointment Date"] = pd.to_datetime(df["Appointment Date"], format="mixed")
+        df["Booked Date"] = pd.to_datetime(df["Booked Date"], format="mixed")
+    except FileNotFoundError:
+        df = pd.DataFrame(columns=appt_cols)
+        df["Appointment Date"] = pd.to_datetime(df["Appointment Date"])
+        df["Booked Date"] = pd.to_datetime(df["Booked Date"])
+    try:
+        gs = pd.read_csv("guest_summary.csv")
+    except FileNotFoundError:
+        gs = pd.DataFrame(columns=gs_cols)
+    return df, gs
+
+_init_df, _init_gs = _load_or_empty()
 _init_stylists = sorted(_init_gs["PreferredStylist"].dropna().unique().tolist())
 
 # UI definition
@@ -82,11 +99,20 @@ app_ui = ui.page_fluid(
     )
 ),
         ui.nav_panel("Refresh Data",
-                ui.card( 
-                     ui.h3("Update Dashboard Data"),
-                     ui.output_text("cutoff_message"),
-                     ui.input_file("new_data", "Upload Zenoti Export", accept=[".csv"]),
-                     ui.output_text("upload_status")))
+            ui.card(
+                ui.h3("Update Dashboard Data"),
+                ui.output_text("cutoff_message"),
+                ui.input_file("new_data", "Upload Zenoti Export", accept=[".csv"]),
+                ui.output_text("upload_status"),
+            ),
+            ui.card(
+                ui.h3("Save Your Progress"),
+                ui.p("Important: this dashboard does not save your data permanently. "
+                     "Before closing, download your cleaned data below and keep it on your computer. "
+                     "Next time you open the dashboard, upload that file first to restore everything."),
+                ui.download_button("download_data", "Download Cleaned Data"),
+            ),
+        )
     )
 )
 
@@ -105,39 +131,46 @@ def server(input, output, session):
         if file_info is None:
             return
         path = file_info[0]["datapath"]
-        updated_df = pipeline.merge_incremental(clean_df(), path)
-        updated_gs = pipeline.run_pipeline(updated_df)
-        updated_df.to_csv("appointments_clean.csv", index=False)
-        updated_gs.to_csv("guest_summary.csv", index=False)
-        clean_df.set(updated_df)
-        guest_summary_rv.set(updated_gs)
-        upload_msg.set("✓ Data updated successfully.")
+        try:
+            updated_df = pipeline.merge_incremental(clean_df(), path)
+            updated_gs = pipeline.run_pipeline(updated_df)
+            updated_df.to_csv("appointments_clean.csv", index=False)
+            updated_gs.to_csv("guest_summary.csv", index=False)
+            clean_df.set(updated_df)
+            guest_summary_rv.set(updated_gs)
+            upload_msg.set("✓ Data updated successfully.")
+        except Exception as e:
+            print(f"Upload failed: {e}")
+            upload_msg.set(
+                "⚠️ Could not process that file. Make sure it's a Zenoti "
+                "Appointments export (.csv) and try again."
+            )
+    @render.download(filename=lambda: f"appointments_clean_{pipeline.today().date()}.csv")
+    def download_data():
+        yield clean_df().to_csv(index=False)
     @render.text
     def upload_status():
         return upload_msg()
+
     @render.text
     def cutoff_message():
         df = clean_df()
+        if df.empty:
+            return "No data loaded yet. Upload a Zenoti Appointments CSV below to get started."
         date = pipeline.get_data_cutoff(df)
-        message = f"Your data is current through {date}. To refresh, export appointments from Zenoti starting {date} and upload below."
-        return message
+        return f"Your data is current through {date}. To refresh, export appointments from Zenoti starting {date} and upload below."
     @reactive.Calc
     def monthly_customers():
         df = clean_df()
         mc = df.groupby(df["Appointment Date"].dt.to_period("W"))["Guest Name"].nunique()
-        mc = mc[mc.index < pd.Timestamp("today").to_period("W")]
+        mc = mc[mc.index < pipeline.today().to_period("W")]
         return mc
-    @reactive.Calc
-    def stylist_options():
-        guest_summary = guest_summary_rv()
-        stylists = sorted(guest_summary["PreferredStylist"].dropna().unique().tolist())
-        return stylists
     @reactive.Calc
     def stylist_retention():
         df = clean_df()
         guest_summary = guest_summary_rv()
         last_active = df.groupby("Stylist")["Appointment Date"].max()
-        recent_cutoff = pd.Timestamp("today") - pd.Timedelta(days=90)
+        recent_cutoff = pipeline.today() - pd.Timedelta(days=90)
         current_stylists = last_active[last_active >= recent_cutoff].index
         stylist_counts = guest_summary["PreferredStylist"].value_counts()
         main_stylists = stylist_counts[(stylist_counts >= 30) & (stylist_counts.index.isin(current_stylists))].index
@@ -151,7 +184,7 @@ def server(input, output, session):
     @render.text
     def active_count():
         count = (guest_summary_rv()["Status"] == "Active").sum()
-        return f"{count:,}"  # we'll fill this in
+        return f"{count:,}"
     @render.text
     def at_risk_count():
         count = (guest_summary_rv()["Status"] == "At Risk").sum()
@@ -163,28 +196,38 @@ def server(input, output, session):
     @render.text
     def active_pct():
         total = len(guest_summary_rv())
+        if total == 0:
+            return "—"
         pct = (guest_summary_rv()["Status"] == "Active").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def at_risk_pct():
         total = len(guest_summary_rv())
+        if total == 0:
+            return "—"
         pct = (guest_summary_rv()["Status"] == "At Risk").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def churned_pct():
         total = len(guest_summary_rv())
+        if total == 0:
+            return "—"
         pct = (guest_summary_rv()["Status"] == "Churned").sum() / total * 100
         return f"{pct:.0f}% of all customers"
     @render.text
     def new_guest_stat():
-        single_visit = (guest_summary_rv()["VisitCount"] == 1).sum()
         total_guest = len(guest_summary_rv())
-        no_return_pct = (single_visit/total_guest) * 100
+        if total_guest == 0:
+            return "No data yet"
+        single_visit = (guest_summary_rv()["VisitCount"] == 1).sum()
+        no_return_pct = (single_visit / total_guest) * 100
         return f"{no_return_pct:.0f}% of new guests never return"
     @render.text
     def new_guest_detail():
-        single = (guest_summary_rv()["VisitCount"] == 1).sum()
         total = len(guest_summary_rv())
+        if total == 0:
+            return "Upload data to populate this dashboard."
+        single = (guest_summary_rv()["VisitCount"] == 1).sum()
         returned = total - single
         return f"Out of {total:,} first-time visitors, only {returned:,} came back."
 
@@ -192,14 +235,21 @@ def server(input, output, session):
     def cohort_chart():
         matrix = cohort_retention()
         fig, ax = plt.subplots(figsize=(16, 16), tight_layout=True)
+        if matrix.empty:
+            ax.text(0.5, 0.5, "Upload data on the Refresh Data tab to see this chart.",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=12, color='#999')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            return fig
         im = ax.imshow(matrix.values, aspect="auto", cmap="YlGn", vmin=0, vmax=40)
         fig.colorbar(im, ax=ax, label="Retention %")
-
         ax.set_xticks(range(len(matrix.columns)))
         ax.set_xticklabels(matrix.columns)
         ax.set_yticks(range(len(matrix.index)))
         ax.set_yticklabels([str(p) for p in matrix.index], fontsize=9)
-
         for i in range(matrix.shape[0]):
             for j in range(matrix.shape[1]):
                 val = matrix.iloc[i, j]
@@ -207,7 +257,6 @@ def server(input, output, session):
                     text_color = "white" if val > 25 else "black"
                     ax.text(j, i, f"{val:.0f}", ha="center", va="center",
                             fontsize=8, color=text_color)
-
         ax.set_xlabel("Months since first visit")
         ax.set_ylabel("Cohort (first visit month)")
         return fig
@@ -215,6 +264,15 @@ def server(input, output, session):
     @render.plot
     def trend_chart():
         fig, ax = plt.subplots(figsize=(10, 4), tight_layout=True)
+        if clean_df().empty:
+            ax.text(0.5, 0.5, "Upload data on the Refresh Data tab to see this chart.",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=12, color='#999')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            return fig
         x_data = monthly_customers().index.to_timestamp()
         y_data = monthly_customers().values
         ax.plot(x_data, y_data, color="#2b5c8f", linewidth=2.5, label="Active Customers")
@@ -247,6 +305,10 @@ def server(input, output, session):
             data = data[data["Guest Name"].str.contains(
                 input.name_search(), case=False, na=False, regex=False
             )]
+        if data.empty:
+            return render.DataGrid(pd.DataFrame(
+                {"": ["No customers to display. Upload data on the Refresh Data tab to get started."]}
+            ))
         data = data.sort_values("DaysSinceLastVisit", ascending=False)
         display = data[[
             "Guest Name", "Status", "LastVisit", "DaysSinceLastVisit",
@@ -258,16 +320,23 @@ def server(input, output, session):
     @render.plot
     def stylist_chart():
         fig, ax = plt.subplots(figsize=(10, 6), tight_layout=True)
-
-        names = stylist_retention().index
-        active = stylist_retention()["Active"]
-        at_risk = stylist_retention()["At Risk"]
-        churned = stylist_retention()["Churned"]
-
+        sr = stylist_retention()
+        if sr.empty:
+            ax.text(0.5, 0.5, "Upload data on the Refresh Data tab to see this chart.",
+                    ha='center', va='center', transform=ax.transAxes,
+                    fontsize=12, color='#999')
+            ax.set_xticks([])
+            ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            return fig
+        names = sr.index
+        active = sr["Active"]
+        at_risk = sr["At Risk"]
+        churned = sr["Churned"]
         ax.barh(names, active, color="#2e7d32", label="Active")
         ax.barh(names, at_risk, left=active, color="#f5a623", label="At Risk")
         ax.barh(names, churned, left=active + at_risk, color="#c0392b", label="Churned")
-
         ax.set_xlabel("Percentage of Customers")
         ax.legend(loc="lower right")
         return fig
