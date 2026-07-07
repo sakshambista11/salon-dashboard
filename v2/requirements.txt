@@ -1,0 +1,9 @@
+pandas==2.3.0
+numpy==2.3.0
+matplotlib==3.10.3
+shiny==1.6.3
+shinywidgets==0.8.1
+scikit-learn==1.6.1
+plotly==5.24.1
+joblib==1.4.2
+pytest==8.3.3
